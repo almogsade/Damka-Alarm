@@ -1,13 +1,15 @@
 #include <avr/io.h>
 #include <stdbool.h>
 
+#include "io_map.h"
+
 #include "uart.h"
 #include "dfplayer.h"
 #include "tm1637.h"
 #include "timer.h"
 #include "buttons.h"
 
-// --- STATE MACHINE DEFINITIONS ---
+// --- STATE DEFINITIONS ---
 typedef enum {
     STATE_IDLE,
     STATE_SET_MIN,
@@ -19,132 +21,174 @@ typedef enum {
 
 TimerState currentState = STATE_IDLE;
 
-// Time Variables
-uint8_t minutes = 0;
-uint8_t seconds = 0;
-uint8_t stored_minutes = 0;
-uint8_t stored_seconds = 0;
+// --- DATA VARIABLES ---
+// 'stored' holds the config, 'live' holds the countdown
+uint8_t stored_min = 0;
+uint8_t stored_sec = 0;
+int8_t  live_min = 0; // Signed to make underflow logic easier
+int8_t  live_sec = 0;
 
-// Logic Variables
-uint32_t last_second_tick = 0;
+// --- TIMING VARIABLES ---
+uint32_t last_tick_time = 0;
 uint32_t last_blink_time = 0;
-bool blink_state = false;
+bool blink_on = true;
 
-// --- DISPLAY HELPER ---
-void update_display(void) {
-    bool show_colon = true;
+// --- DISPLAY LOGIC ---
+void refresh_display(void) {
     uint32_t now = millis();
-
-    // Blink Logic (approx 300ms toggle)
-    if (now - last_blink_time >= 300) {
-        blink_state = !blink_state;
+    bool show_colon = true;
+    
+    // 500ms Slow Blink for UI
+    if (now - last_blink_time >= 500) {
+        blink_on = !blink_on;
         last_blink_time = now;
     }
 
-    // -- Visual State Feedback --
-    // If setting MIN, blink colon? Or we could blink the number digits if we modified the lib.
-    // For now, let's just blink the colon to indicate "Edit Mode".
-    if ((currentState == STATE_SET_MIN || currentState == STATE_SET_SEC) && !blink_state) {
+    uint8_t d_min = (currentState == STATE_RUNNING || currentState == STATE_PAUSED) ? live_min : stored_min;
+    uint8_t d_sec = (currentState == STATE_RUNNING || currentState == STATE_PAUSED) ? live_sec : stored_sec;
+
+    // Visual Feedback based on State
+    if (currentState == STATE_SET_MIN && !blink_on) {
+        // While setting minutes, we could blank them or just blink colon rapidly
+        // Let's blink the colon to indicate Edit Mode
+        show_colon = false; 
+    }
+    else if (currentState == STATE_SET_SEC && !blink_on) {
         show_colon = false;
     }
-    
-    // If PAUSED, Blink the whole display (off/on)
-    if (currentState == STATE_PAUSED && !blink_state) {
-        tm1637_clear(); // You might need to add this to tm1637.c or use display_segments(0,0,0,0)
-        return; 
+    else if (currentState == STATE_PAUSED && !blink_on) {
+        // Flash entire display in Pause
+        tm1637_display_segments(0,0,0,0); 
+        return;
+    }
+    else if (currentState == STATE_ALARM) {
+         // Flash "00:00" rapidly
+         if (!blink_on) {
+             tm1637_display_segments(0,0,0,0);
+             return;
+         }
+         d_min = 0; d_sec = 0;
     }
 
-    tm1637_display_time(minutes, seconds, show_colon);
+    tm1637_display_time(d_min, d_sec, show_colon);
 }
 
 int main(void) {
-    // 1. Initialize Subsystems
-    timer_init();      // Starts the millisecond counter
-    buttons_init();    // Configures Button Pins
-    UART_Init();       // Comms
-    tm1637_init(0, 1); // Display on PB0/PB1
+    // 1. Hardware Initialization via IO_MAP
+    timer_init();
+    buttons_init();
+    UART_Init();
+    
+    // TM1637 Init (using pins from io_map.h)
+    tm1637_init();
 
-    // 2. Initialize Player
-    DF_Init(); 
-    DF_SetVolume(20);
-    DF_PlayTrack(1); // Boot Sound
+    // DFPlayer Init
+    DF_Init();
+    DF_SetVolume(18);
 
-    // 3. Application Loop
     while (1) {
-        uint8_t btn = buttons_read(); // Non-blocking read
+        ButtonID btn = buttons_read();
         uint32_t now = millis();
 
         switch (currentState) {
-            
+            // --- IDLE STATE ---
             case STATE_IDLE:
-                if (btn == BTN_1) {
-                    currentState = STATE_SET_MIN;
-                } else if (btn == BTN_2) {
-                    minutes = 0; seconds = 0; 
-                } else if (btn == BTN_3) {
-                    stored_minutes = minutes;
-                    stored_seconds = seconds;
-                    // Only start if time is set
-                    if (minutes > 0 || seconds > 0) {
+                if (btn == BTN_L) {
+                    currentState = STATE_SET_MIN; // Shortcut to Min
+                } 
+                else if (btn == BTN_R) {
+                    currentState = STATE_SET_SEC; // Shortcut to Sec
+                } 
+                else if (btn == BTN_M) {
+                    // Start Timer
+                    if (stored_min > 0 || stored_sec > 0) {
+                        live_min = stored_min;
+                        live_sec = stored_sec;
                         currentState = STATE_RUNNING;
-                        last_second_tick = now;
+                        last_tick_time = now;
                     }
                 }
                 break;
 
+            // --- CONFIGURATION STATES ---
             case STATE_SET_MIN:
-                if (btn == BTN_1) currentState = STATE_SET_SEC;
-                else if (btn == BTN_2) { minutes = (minutes >= 99) ? 0 : minutes + 1; }
-                else if (btn == BTN_3) { minutes = (minutes == 0) ? 99 : minutes - 1; }
+                // L = Down, R = Up, M = Accept (Go to Sec)
+                if (btn == BTN_L) {
+                    if (stored_min == 0) stored_min = 99; else stored_min--;
+                } 
+                else if (btn == BTN_R) {
+                    if (stored_min >= 99) stored_min = 0; else stored_min++;
+                } 
+                else if (btn == BTN_M) {
+                    currentState = STATE_SET_SEC; 
+                }
                 break;
 
             case STATE_SET_SEC:
-                if (btn == BTN_1) currentState = STATE_IDLE;
-                else if (btn == BTN_2) { seconds = (seconds >= 59) ? 0 : seconds + 1; }
-                else if (btn == BTN_3) { seconds = (seconds == 0) ? 59 : seconds - 1; }
+                // L = Down, R = Up, M = Accept (Go to IDLE)
+                if (btn == BTN_L) {
+                    if (stored_sec == 0) stored_sec = 59; else stored_sec--;
+                } 
+                else if (btn == BTN_R) {
+                    if (stored_sec >= 59) stored_sec = 0; else stored_sec++;
+                } 
+                else if (btn == BTN_M) {
+                    currentState = STATE_IDLE; 
+                }
                 break;
 
+            // --- RUNNING STATE ---
             case STATE_RUNNING:
-                if (btn == BTN_1) currentState = STATE_PAUSED;
-                
-                // Non-blocking timer logic
-                if (now - last_second_tick >= 1000) {
-                    last_second_tick += 1000; // Exact interval tracking
+                // M = Pause
+                if (btn == BTN_M) {
+                    currentState = STATE_PAUSED;
+                }
+                // (Optional: BTN_L could be Stop/Reset if desired, keeping simple for now)
+
+                // Timer Logic
+                if (now - last_tick_time >= 1000) {
+                    last_tick_time += 1000;
                     
-                    if (seconds == 0) {
-                        if (minutes == 0) {
+                    if (live_sec == 0) {
+                        if (live_min == 0) {
+                            // TIMER FINISHED
                             currentState = STATE_ALARM;
-                            DF_PlayTrack(2); 
+                            DF_PlayTrack(1); // Play Alarm Sound
                         } else {
-                            minutes--;
-                            seconds = 59;
+                            live_min--;
+                            live_sec = 59;
                         }
                     } else {
-                        seconds--;
+                        live_sec--;
                     }
                 }
                 break;
 
+            // --- PAUSED STATE ---
             case STATE_PAUSED:
-                if (btn == BTN_1) {
+                // M = Resume, L/R = Reset to IDLE?
+                if (btn == BTN_M) {
                     currentState = STATE_RUNNING;
-                    last_second_tick = now; // Prevent immediate jump
-                } else if (btn == BTN_2) {
-                    currentState = STATE_IDLE;
-                    minutes = 0; seconds = 0;
+                    last_tick_time = now; // Prevent jump
+                } 
+                else if (btn == BTN_L || btn == BTN_R) {
+                    currentState = STATE_IDLE; // Reset
                 }
                 break;
 
+            // --- ALARM STATE ---
             case STATE_ALARM:
+                // "Until any button is pressed"
                 if (btn != BTN_NONE) {
-                    DF_Pause(); 
+                    DF_Pause(); // Stop Sound Immediately
                     currentState = STATE_IDLE;
-                    minutes = stored_minutes;
-                    seconds = stored_seconds;
+                    // Reset live values is implied by reloading from 'stored' next run
                 }
+                // Note: If track finishes, DFPlayer stops. 
+                // Ideally, use a looping track or send Loop Command if supported.
                 break;
         }
 
-        update_display();
+        refresh_display();
     }
 }
